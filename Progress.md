@@ -2,8 +2,19 @@
 
 ## Context notes
 - Repository was empty at session start (no commits, no `graphify-out/` directory).
-- User preference is to query the graphify knowledge graph (`graphify-out/wiki/index.md`), but **no graphify output exists in this repo yet**, so there is nothing to query. Proceeding with a greenfield build.
+- No `graphify` CLI exists in this environment (the npm `graphify` package is an
+  unrelated "Random Graph Generator"). The graphify wiki was therefore authored
+  manually under `graphify-out/wiki/` to match the project convention, so future
+  sessions can query `graphify-out/wiki/index.md` per user preference.
 - Branch: `claude/intelligent-shannon-7pgma3`
+
+## Graphify knowledge graph (`graphify-out/wiki/`)
+- `index.md` — entry point / repo map / quick facts
+- `architecture.md` — load graph, runtime component graph, two-engine model
+- `files/{index-html,styles-css,game-js}.md` — per-file references
+- `concepts/{physics,modes}.md` — slingshot math, anti-tunneling, modes, aim assist
+- `api/{GameEnv,KnockHockey}.md` — headless RL bridge + test hook
+- `graph.json` — machine-readable knowledge graph (46 nodes, 43 edges, validated)
 
 ## Task
 Build a complete 2D physics **Knock Hockey** prototype (HTML + CSS + Matter.js) that runs in a desktop browser but is structurally constrained to look/behave like an iOS mobile app.
