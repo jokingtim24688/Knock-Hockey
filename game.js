@@ -1,51 +1,63 @@
 /* ============================================================================
  * KNOCK HOCKEY — 2D physics prototype (Matter.js)
  *
- * Top-down, zero-gravity arena. Two strikers + one high-restitution puck.
- * Runs in a desktop browser but is structurally constrained to a 390x844
- * "phone" viewport (see index.html / styles.css).
+ * Top-down, zero-gravity arena. The player flicks THE PUCK directly with a
+ * drag-and-release slingshot; the puck ricochets off walls and bumpers and is
+ * scored when it enters a goal.
  *
  * Two engine states, switched by the overlay Mode Toggle:
  *   - NORMAL   : human drag-and-release slingshot; optional AI Aim Assist.
  *   - TRAINING : human input disabled; the real engine's auto-runner is
  *                stopped and the world is advanced ONLY through
  *                GameEnv.step(action) — the bridge for an external RL agent.
+ *
+ * SLINGSHOT MATH (impulse model)
+ *   Grab the puck, drag to a pointer P. Let A be the puck anchor (its frozen
+ *   center). The "pull-back" vector is  pull = A - P.
+ *     distance = |pull|                    (how far you dragged)
+ *     angle    = atan2(pull.y, pull.x)     (launch heading = opposite the drag)
+ *     speed    = clamp(distance * FLICK_GAIN, 0, FLICK_MAX_SPEED)
+ *     velocity = normalize(pull) * speed
+ *   The puck is frozen (v = 0) while aiming, so setVelocity(velocity) is a pure
+ *   impulse J = m * velocity applied at release. Launch is exactly opposite the
+ *   drag and its magnitude is proportional to the drag distance.
  * ==========================================================================*/
 
 (function () {
   "use strict";
 
-  /* ----- Matter.js module aliases ---------------------------------------- */
-  const {
-    Engine, Render, Runner, World, Bodies, Body, Composite,
-    Events, Vector, Query
-  } = Matter;
+  const { Engine, Render, Runner, World, Bodies, Body, Composite, Events, Vector } = Matter;
 
   /* ----- Tunable physics constants --------------------------------------- */
   const CONFIG = {
-    // Puck: bouncy and slippery, with just enough air friction to settle.
-    PUCK_RESTITUTION: 0.92,
-    PUCK_FRICTION_AIR: 0.018,   // carefully tuned: high enough to stop drifting forever
+    // Puck: bouncy + slippery, with a touch of air friction so it settles.
+    PUCK_RESTITUTION: 0.9,     // aggressive ricochet off walls/bumpers
+    PUCK_FRICTION_AIR: 0.012,  // long glide, but decays to a stop
     PUCK_FRICTION: 0.0,
-    PUCK_RADIUS: 14,
-    PUCK_DENSITY: 0.002,
+    PUCK_FRICTION_STATIC: 0.0,
+    PUCK_RADIUS: 16,
+    PUCK_DENSITY: 0.004,
 
-    // Strikers: heavier, still bouncy, slightly draggier so flicks decay.
-    STRIKER_RESTITUTION: 0.6,
-    STRIKER_FRICTION_AIR: 0.06,
-    STRIKER_RADIUS: 20,
-    STRIKER_DENSITY: 0.006,
+    WALL_RESTITUTION: 0.9,
+    WALL_THICKNESS: 80,        // thick walls: with the speed cap below, the puck
+                               // can never travel more than one wall-thickness
+                               // per tick, so it cannot tunnel through.
+    GOAL_WIDTH: 132,
 
-    WALL_THICKNESS: 60,         // thick + partly offscreen to prevent tunneling
-    GOAL_WIDTH: 120,            // width of the goal opening (top & bottom)
+    BUMPER_RESTITUTION: 1.0,
 
-    // Slingshot: release velocity = pullback vector * this gain.
-    FLICK_GAIN: 0.16,
-    FLICK_MAX_SPEED: 26,        // clamp so a huge drag can't launch absurdly fast
+    // Slingshot tuning.
+    FLICK_GAIN: 0.16,          // velocity per pixel of drag distance
+    FLICK_MAX_SPEED: 30,       // hard cap (px/tick). < WALL_THICKNESS => no tunneling
+    FLICK_DEADZONE: 4,         // ignore micro-drags (px)
 
-    GHOST_TICKS: 150,           // how far forward the aim-assist ghost simulates
-    GHOST_DT: 1000 / 60,        // ms per ghost tick (matches 60fps)
-    TRAIN_DT: 1000 / 60         // ms advanced per GameEnv.step()
+    STOP_THRESHOLD: 0.09,      // below this speed the puck snaps to a full stop
+
+    GHOST_TICKS: 170,          // aim-assist look-ahead
+    GHOST_DT: 1000 / 60,
+    TRAIN_DT: 1000 / 60,
+
+    GRAB_SLOP: 16              // extra px around the puck that still starts a drag
   };
 
   const MODE = { NORMAL: "normal", TRAINING: "training" };
@@ -55,19 +67,15 @@
     mode: MODE.NORMAL,
     aimAssist: false,
     score: { left: 0, right: 0 },
-
-    // Live drag (slingshot) state
     dragging: false,
-    dragStart: null,   // striker anchor (world coords)
-    dragCurrent: null, // pointer position (world coords)
-
-    // Cached ghost-trajectory point array for rendering
+    dragAnchor: null,   // puck center captured at grab time (world coords)
+    dragCurrent: null,  // live pointer position (world coords)
     assistPath: null
   };
 
   /* ----- DOM handles ----------------------------------------------------- */
-  const arenaEl   = document.getElementById("arena");
-  const canvasEl  = document.getElementById("game-canvas");
+  const arenaEl      = document.getElementById("arena");
+  const canvasEl     = document.getElementById("game-canvas");
   const scoreLeftEl  = document.getElementById("score-left");
   const scoreRightEl = document.getElementById("score-right");
   const modeHintEl   = document.getElementById("mode-hint");
@@ -75,10 +83,14 @@
   /* ----- Engine / render / runner ---------------------------------------- */
   const engine = Engine.create();
   engine.gravity.x = 0;
-  engine.gravity.y = 0;              // top-down: NO gravity
+  engine.gravity.y = 0;                 // top-down: NO gravity
+  // More solver iterations => crisp, stable high-speed bounces.
+  engine.positionIterations = 10;
+  engine.velocityIterations = 10;
+  engine.constraintIterations = 4;
   const world = engine.world;
 
-  // Size the world to the arena box (CSS pixels == world pixels, 1:1).
+  // World == arena box in CSS pixels, 1:1 (critical for drag-line alignment).
   const W = arenaEl.clientWidth;
   const H = arenaEl.clientHeight;
 
@@ -88,10 +100,10 @@
     options: {
       width: W,
       height: H,
-      pixelRatio: "auto",
+      pixelRatio: window.devicePixelRatio || 1,
       background: "transparent",
-      wireframes: false,          // we hand-pick flat colors for the sketch look
-      showVelocity: false
+      wireframes: false,
+      hasBounds: false          // keep world<->screen mapping identity
     }
   });
   Render.run(render);
@@ -101,168 +113,162 @@
   /* ========================================================================
    * ARENA CONSTRUCTION
    * ======================================================================*/
+  let puck, goalTop, goalBottom;
+  const PUCK_START = { x: W / 2, y: H / 2 };
 
-  // Body references we need to reach later.
-  let puck, playerStriker, aiStriker;
-  let goalTop, goalBottom;
-
-  const STATIC_STYLE  = { isStatic: true, render: { fillStyle: "#2a2e3a", strokeStyle: "#6f7480", lineWidth: 1 } };
-  const BUMPER_STYLE  = { isStatic: true, restitution: 1.0, render: { fillStyle: "#1c1f29", strokeStyle: "#8a90a0", lineWidth: 1 } };
+  const wallStyle   = { isStatic: true, restitution: CONFIG.WALL_RESTITUTION, label: "wall",
+                        render: { fillStyle: "#1a1f2b", strokeStyle: "rgba(255,255,255,0.10)", lineWidth: 1 } };
+  const bumperStyle = { isStatic: true, restitution: CONFIG.BUMPER_RESTITUTION, label: "bumper",
+                        render: { fillStyle: "#161b26", strokeStyle: "rgba(255,255,255,0.22)", lineWidth: 1.5 } };
 
   function buildArena() {
     const t  = CONFIG.WALL_THICKNESS;
     const gw = CONFIG.GOAL_WIDTH;
-    const midX = W / 2;
     const sideLen = (W - gw) / 2;
 
-    // --- Perimeter walls. Top and bottom are split to leave a goal gap. ---
-    const topLeft  = Bodies.rectangle(sideLen / 2,        -t / 2 + 1, sideLen, t, { ...STATIC_STYLE, label: "wall" });
-    const topRight = Bodies.rectangle(W - sideLen / 2,    -t / 2 + 1, sideLen, t, { ...STATIC_STYLE, label: "wall" });
-    const botLeft  = Bodies.rectangle(sideLen / 2,      H + t / 2 - 1, sideLen, t, { ...STATIC_STYLE, label: "wall" });
-    const botRight = Bodies.rectangle(W - sideLen / 2,  H + t / 2 - 1, sideLen, t, { ...STATIC_STYLE, label: "wall" });
-    const leftWall  = Bodies.rectangle(-t / 2 + 1, H / 2, t, H + t * 2, { ...STATIC_STYLE, label: "wall" });
-    const rightWall = Bodies.rectangle(W + t / 2 - 1, H / 2, t, H + t * 2, { ...STATIC_STYLE, label: "wall" });
+    // Perimeter walls; top & bottom split to leave a centered goal gap.
+    const walls = [
+      Bodies.rectangle(sideLen / 2,       -t / 2 + 1, sideLen, t, { ...wallStyle }),
+      Bodies.rectangle(W - sideLen / 2,   -t / 2 + 1, sideLen, t, { ...wallStyle }),
+      Bodies.rectangle(sideLen / 2,      H + t / 2 - 1, sideLen, t, { ...wallStyle }),
+      Bodies.rectangle(W - sideLen / 2,  H + t / 2 - 1, sideLen, t, { ...wallStyle }),
+      Bodies.rectangle(-t / 2 + 1, H / 2, t, H + t * 2, { ...wallStyle }),
+      Bodies.rectangle(W + t / 2 - 1, H / 2, t, H + t * 2, { ...wallStyle })
+    ];
 
-    // --- Central bumpers (static obstacles) ---
-    const bumperA = Bodies.circle(midX, H / 2, 22, { ...BUMPER_STYLE, label: "bumper" });
-    const bumperB = Bodies.circle(midX - 90, H / 2, 12, { ...BUMPER_STYLE, label: "bumper" });
-    const bumperC = Bodies.circle(midX + 90, H / 2, 12, { ...BUMPER_STYLE, label: "bumper" });
+    // Bumpers placed off the center so the puck's start is clear.
+    const bumpers = [
+      Bodies.circle(W * 0.30, H * 0.36, 17, { ...bumperStyle }),
+      Bodies.circle(W * 0.70, H * 0.64, 17, { ...bumperStyle }),
+      Bodies.circle(W * 0.72, H * 0.30, 11, { ...bumperStyle }),
+      Bodies.circle(W * 0.28, H * 0.70, 11, { ...bumperStyle })
+    ];
 
-    // --- Goal sensors (no physical response, just detection zones) ---
-    goalTop = Bodies.rectangle(midX, 6, gw, 12, {
+    // Goal sensors (detection only, no physical response).
+    goalTop = Bodies.rectangle(W / 2, 5, gw, 12, {
       isStatic: true, isSensor: true, label: "goal-top",
-      render: { fillStyle: "rgba(255,122,89,0.18)", strokeStyle: "#ff7a59", lineWidth: 1 }
+      render: { fillStyle: "rgba(255,159,10,0.16)", strokeStyle: "#ff9f0a", lineWidth: 1.5 }
     });
-    goalBottom = Bodies.rectangle(midX, H - 6, gw, 12, {
+    goalBottom = Bodies.rectangle(W / 2, H - 5, gw, 12, {
       isStatic: true, isSensor: true, label: "goal-bottom",
-      render: { fillStyle: "rgba(78,161,255,0.18)", strokeStyle: "#4ea1ff", lineWidth: 1 }
+      render: { fillStyle: "rgba(10,132,255,0.16)", strokeStyle: "#0a84ff", lineWidth: 1.5 }
     });
 
-    // --- Dynamic bodies ---
-    puck = Bodies.circle(midX, H / 2 - 60, CONFIG.PUCK_RADIUS, {
+    // THE PUCK — the one dynamic body the player controls.
+    puck = Bodies.circle(PUCK_START.x, PUCK_START.y, CONFIG.PUCK_RADIUS, {
       label: "puck",
       restitution: CONFIG.PUCK_RESTITUTION,
       frictionAir: CONFIG.PUCK_FRICTION_AIR,
       friction: CONFIG.PUCK_FRICTION,
+      frictionStatic: CONFIG.PUCK_FRICTION_STATIC,
       density: CONFIG.PUCK_DENSITY,
-      render: { fillStyle: "#e8e8e8", strokeStyle: "#ffffff", lineWidth: 1 }
+      isBullet: true,           // intent flag (Matter 0.19 has no native CCD;
+                                // real anti-tunneling comes from the speed cap)
+      render: { fillStyle: "#f4f6fa", strokeStyle: "#ffffff", lineWidth: 2 }
     });
 
-    playerStriker = Bodies.circle(midX, H * 0.82, CONFIG.STRIKER_RADIUS, {
-      label: "player",
-      restitution: CONFIG.STRIKER_RESTITUTION,
-      frictionAir: CONFIG.STRIKER_FRICTION_AIR,
-      density: CONFIG.STRIKER_DENSITY,
-      render: { fillStyle: "#12324f", strokeStyle: "#4ea1ff", lineWidth: 2 }
-    });
-
-    aiStriker = Bodies.circle(midX, H * 0.18, CONFIG.STRIKER_RADIUS, {
-      label: "ai",
-      restitution: CONFIG.STRIKER_RESTITUTION,
-      frictionAir: CONFIG.STRIKER_FRICTION_AIR,
-      density: CONFIG.STRIKER_DENSITY,
-      render: { fillStyle: "#4f231a", strokeStyle: "#ff7a59", lineWidth: 2 }
-    });
-
-    World.add(world, [
-      topLeft, topRight, botLeft, botRight, leftWall, rightWall,
-      bumperA, bumperB, bumperC,
-      goalTop, goalBottom,
-      puck, playerStriker, aiStriker
-    ]);
+    World.add(world, [...walls, ...bumpers, goalTop, goalBottom, puck]);
   }
 
   /* ========================================================================
-   * GOAL DETECTION
+   * GOAL DETECTION + CLEAN-STOP
    * ======================================================================*/
   Events.on(engine, "collisionStart", function (evt) {
     for (const pair of evt.pairs) {
       const labels = [pair.bodyA.label, pair.bodyB.label];
       if (!labels.includes("puck")) continue;
+      if (labels.includes("goal-top"))    { state.score.left  += 1; onGoalScored(); }
+      else if (labels.includes("goal-bottom")) { state.score.right += 1; onGoalScored(); }
+    }
+  });
 
-      // Puck into the TOP goal => the bottom (player / left-score) player scored.
-      if (labels.includes("goal-top")) {
-        state.score.left += 1;
-        onGoalScored();
-      } else if (labels.includes("goal-bottom")) {
-        state.score.right += 1;
-        onGoalScored();
-      }
+  // Snap the puck to a full, clean stop once it's crawling — no infinite drift.
+  Events.on(engine, "afterUpdate", function () {
+    if (state.dragging) return;
+    const speed = Vector.magnitude(puck.velocity);
+    if (speed > 0 && speed < CONFIG.STOP_THRESHOLD) {
+      Body.setVelocity(puck, { x: 0, y: 0 });
+      Body.setAngularVelocity(puck, 0);
     }
   });
 
   function onGoalScored() {
     updateScoreboard();
-    // Re-center the puck; leave strikers where they are.
-    Body.setPosition(puck, { x: W / 2, y: H / 2 - 60 });
+    recenterPuck();
+  }
+  function recenterPuck() {
+    Body.setPosition(puck, { x: PUCK_START.x, y: PUCK_START.y });
     Body.setVelocity(puck, { x: 0, y: 0 });
     Body.setAngularVelocity(puck, 0);
   }
-
   function updateScoreboard() {
     scoreLeftEl.textContent = String(state.score.left);
     scoreRightEl.textContent = String(state.score.right);
   }
 
   /* ========================================================================
-   * HUMAN SLINGSHOT (NORMAL MODE ONLY)
-   *
-   * Drag-and-release: press on your striker, pull back, release to flick.
-   * Release velocity points from the pointer back toward the striker
-   * (classic slingshot), scaled by FLICK_GAIN and clamped to FLICK_MAX_SPEED.
+   * COORDINATE MAPPING
+   * The canvas backing store is scaled by devicePixelRatio, but Matter's
+   * render context maps world units to CSS pixels 1:1 (hasBounds:false, bounds
+   * 0..W/0..H). So (clientX - arenaRect.left, clientY - arenaRect.top) is the
+   * exact world coordinate — no offset, and it's recomputed per event so it
+   * stays correct under scroll/resize.
    * ======================================================================*/
-
   function toWorld(evt) {
     const rect = arenaEl.getBoundingClientRect();
-    const src = evt.touches && evt.touches[0] ? evt.touches[0] : evt;
+    const src = (evt.touches && evt.touches[0]) ? evt.touches[0] : evt;
     return { x: src.clientX - rect.left, y: src.clientY - rect.top };
   }
 
+  /* ========================================================================
+   * SLINGSHOT MATH (pure functions — also exported for tests)
+   * ======================================================================*/
+  function computeFlickVelocity(anchor, pointer) {
+    const pull = Vector.sub(anchor, pointer);          // launch = opposite of drag
+    const distance = Vector.magnitude(pull);
+    if (distance < CONFIG.FLICK_DEADZONE) return { x: 0, y: 0 };
+    const speed = Math.min(distance * CONFIG.FLICK_GAIN, CONFIG.FLICK_MAX_SPEED);
+    const dir = Vector.div(pull, distance);            // normalized (safe: distance>0)
+    return { x: dir.x * speed, y: dir.y * speed };
+  }
+
+  /* ========================================================================
+   * HUMAN SLINGSHOT (NORMAL MODE ONLY)
+   * ======================================================================*/
   function pointerDown(evt) {
-    if (state.mode !== MODE.NORMAL) return;            // input disabled in Training
+    if (state.mode !== MODE.NORMAL) return;
     const p = toWorld(evt);
-    // Only start a drag if the press lands on (or very near) the player striker.
-    const d = Vector.magnitude(Vector.sub(p, playerStriker.position));
-    if (d > CONFIG.STRIKER_RADIUS + 12) return;
+    const d = Vector.magnitude(Vector.sub(p, puck.position));
+    if (d > CONFIG.PUCK_RADIUS + CONFIG.GRAB_SLOP) return;   // must grab the puck
 
     state.dragging = true;
-    state.dragStart = { x: playerStriker.position.x, y: playerStriker.position.y };
+    state.dragAnchor = { x: puck.position.x, y: puck.position.y };  // freeze anchor
     state.dragCurrent = p;
-    // Freeze the striker while aiming so it doesn't drift under the pointer.
-    Body.setVelocity(playerStriker, { x: 0, y: 0 });
-    evt.preventDefault();
+    Body.setVelocity(puck, { x: 0, y: 0 });                 // hold still while aiming
+    Body.setAngularVelocity(puck, 0);
+    if (evt.cancelable) evt.preventDefault();
   }
 
   function pointerMove(evt) {
     if (!state.dragging) return;
     state.dragCurrent = toWorld(evt);
-    evt.preventDefault();
+    // Keep the puck pinned to its anchor while aiming (no drift under pointer).
+    Body.setPosition(puck, state.dragAnchor);
+    Body.setVelocity(puck, { x: 0, y: 0 });
+    if (evt.cancelable) evt.preventDefault();
   }
 
   function pointerUp(evt) {
     if (!state.dragging) return;
     state.dragging = false;
-
-    const launch = computeFlickVelocity(state.dragStart, state.dragCurrent);
-    Body.setVelocity(playerStriker, launch);
-
-    state.dragStart = null;
+    const launch = computeFlickVelocity(state.dragAnchor, state.dragCurrent);
+    Body.setPosition(puck, state.dragAnchor);
+    Body.setVelocity(puck, launch);                         // impulse release
+    state.dragAnchor = null;
     state.dragCurrent = null;
-    evt.preventDefault();
+    if (evt && evt.cancelable) evt.preventDefault();
   }
 
-  // Pullback vector (striker - pointer) => launch direction, scaled & clamped.
-  function computeFlickVelocity(anchor, pointer) {
-    const pull = Vector.sub(anchor, pointer);          // points "forward"
-    let v = Vector.mult(pull, CONFIG.FLICK_GAIN);
-    const speed = Vector.magnitude(v);
-    if (speed > CONFIG.FLICK_MAX_SPEED) {
-      v = Vector.mult(Vector.normalise(v), CONFIG.FLICK_MAX_SPEED);
-    }
-    return v;
-  }
-
-  // Bind pointer + touch events.
   canvasEl.addEventListener("mousedown", pointerDown);
   window.addEventListener("mousemove", pointerMove);
   window.addEventListener("mouseup", pointerUp);
@@ -273,131 +279,107 @@
   /* ========================================================================
    * AIM ASSIST — GHOST ENGINE
    *
-   * When AI Aim Assist is on, the game intercepts a "dummy optimal vector"
-   * (a stand-in for what a real solver/agent would recommend) and runs a
-   * throwaway ghost simulation to preview where that shot would send the
-   * striker/puck. The predicted path is drawn as a dotted line on the real
-   * canvas.
+   * drawAimAssistTrajectory(suggestedVector)
+   * ----------------------------------------
+   * Ghost-engine preview. Recipe (implemented in condensed form below):
+   *   (a) Instantiate a SECOND, INVISIBLE Matter.js engine — see
+   *       ensureGhostEngine(). It has no Render, so it never paints; we only
+   *       read out body coordinates from it.
+   *   (b) Clone the arena state: copy the real static walls + bumpers into the
+   *       ghost world so collisions match exactly. (Done once and cached.)
+   *   (c) Place a ghost puck at the real puck's position and apply
+   *       `suggestedVector` as its initial velocity.
+   *   (d) Step the invisible engine forward INSTANTLY by CONFIG.GHOST_TICKS
+   *       ticks, recording the ghost puck's position after each step.
+   *   (e) Return the coordinate array; the renderer draws it with canvas
+   *       moveTo/lineTo as a dotted line on the real screen (drawDottedPath()).
    * ======================================================================*/
-
-  // A persistent secondary engine reused across frames (rebuilding the static
-  // geometry every frame would be wasteful). Only the ghost striker moves.
   let ghostEngine = null;
-  let ghostStriker = null;
+  let ghostPuck = null;
 
   function ensureGhostEngine() {
     if (ghostEngine) return;
 
-    // --- HOW THE GHOST ENGINE MIRRORS THE ARENA -------------------------
-    // 1. Instantiate a second, INVISIBLE Matter.js engine (no Render attached
-    //    to it — it never draws itself; we only read out body positions).
     ghostEngine = Engine.create();
     ghostEngine.gravity.x = 0;
     ghostEngine.gravity.y = 0;
+    ghostEngine.positionIterations = 10;
+    ghostEngine.velocityIterations = 10;
 
-    // 2. Clone the arena's *static* collision geometry (walls + bumpers) so
-    //    the ghost puck bounces exactly like the real one would. We copy the
-    //    real bodies' vertices/positions rather than re-deriving them, keeping
-    //    the two worlds in lock-step even if the layout changes.
+    // Clone every static, non-sensor body (walls + bumpers) into the ghost world.
     const clones = [];
     for (const body of Composite.allBodies(world)) {
-      if (!body.isStatic || body.isSensor) continue;    // skip goals/sensors
-      const clone = Bodies.fromVertices(
-        body.position.x, body.position.y,
-        body.vertices.map(v => ({ x: v.x, y: v.y })),
-        { isStatic: true }
-      ) || Bodies.circle(body.position.x, body.position.y, body.circleRadius || 10, { isStatic: true });
+      if (!body.isStatic || body.isSensor) continue;
+      const verts = body.vertices.map(v => ({ x: v.x, y: v.y }));
+      let clone = Bodies.fromVertices(body.position.x, body.position.y, [verts], { isStatic: true });
+      if (!clone) {
+        clone = Bodies.circle(body.position.x, body.position.y, body.circleRadius || 10, { isStatic: true });
+      }
       clone.restitution = body.restitution;
       clones.push(clone);
     }
     World.add(ghostEngine.world, clones);
 
-    // 3. Add a ghost striker with the SAME physical params as the real one.
-    ghostStriker = Bodies.circle(0, 0, CONFIG.STRIKER_RADIUS, {
-      restitution: CONFIG.STRIKER_RESTITUTION,
-      frictionAir: CONFIG.STRIKER_FRICTION_AIR,
-      density: CONFIG.STRIKER_DENSITY
+    ghostPuck = Bodies.circle(0, 0, CONFIG.PUCK_RADIUS, {
+      restitution: CONFIG.PUCK_RESTITUTION,
+      frictionAir: CONFIG.PUCK_FRICTION_AIR,
+      friction: CONFIG.PUCK_FRICTION,
+      frictionStatic: CONFIG.PUCK_FRICTION_STATIC,
+      density: CONFIG.PUCK_DENSITY,
+      isBullet: true
     });
-    World.add(ghostEngine.world, ghostStriker);
+    World.add(ghostEngine.world, ghostPuck);
   }
 
-  /**
-   * drawAimAssistTrajectory(suggestedVector)
-   * ----------------------------------------
-   * Placeholder / reference implementation of the "ghost engine" preview.
-   *
-   * Full recipe (implemented below in condensed form):
-   *   (a) Instantiate a second, invisible Matter.js engine — see
-   *       ensureGhostEngine(). It has no Render, so it never paints; we only
-   *       sample body coordinates from it.
-   *   (b) Clone the arena state: copy the real static walls + bumpers into the
-   *       ghost world so collisions match. (Done once and cached.)
-   *   (c) Place a ghost puck/striker at the real striker's position and apply
-   *       `suggestedVector` as its initial velocity.
-   *   (d) Step the invisible engine forward INSTANTLY by CONFIG.GHOST_TICKS
-   *       (150) ticks, recording the ghost body position after each step.
-   *   (e) Return the coordinate array. The renderer then uses canvas
-   *       `moveTo` / `lineTo` with a dashed stroke to draw it on the real
-   *       screen (see drawDottedPath()).
-   *
-   * @param {{x:number, y:number}} suggestedVector - launch velocity to preview.
-   * @returns {Array<{x:number, y:number}>} predicted path points.
-   */
   function drawAimAssistTrajectory(suggestedVector) {
     ensureGhostEngine();
-
-    // (c) Reset the ghost striker onto the real striker and inject the vector.
-    Body.setPosition(ghostStriker, {
-      x: playerStriker.position.x,
-      y: playerStriker.position.y
-    });
-    Body.setAngularVelocity(ghostStriker, 0);
-    Body.setVelocity(ghostStriker, { x: suggestedVector.x, y: suggestedVector.y });
+    // (c) Reset the ghost puck onto the real puck and inject the vector.
+    Body.setPosition(ghostPuck, { x: puck.position.x, y: puck.position.y });
+    Body.setAngularVelocity(ghostPuck, 0);
+    Body.setVelocity(ghostPuck, { x: suggestedVector.x, y: suggestedVector.y });
 
     // (d) Fast-forward the invisible engine and sample the path.
-    const path = [{ x: ghostStriker.position.x, y: ghostStriker.position.y }];
+    const path = [{ x: ghostPuck.position.x, y: ghostPuck.position.y }];
     for (let i = 0; i < CONFIG.GHOST_TICKS; i++) {
       Engine.update(ghostEngine, CONFIG.GHOST_DT);
-      path.push({ x: ghostStriker.position.x, y: ghostStriker.position.y });
+      path.push({ x: ghostPuck.position.x, y: ghostPuck.position.y });
     }
-
-    // (e) Hand the sampled array back; actual drawing happens in afterRender.
-    return path;
+    return path; // (e) drawn by the afterRender hook
   }
 
-  // A dummy stand-in for a "perfect shot" recommendation: aim the striker
-  // straight through the puck toward the opponent's (top) goal. A real system
-  // would replace this with a solver or a trained policy's suggested action.
+  // Dummy "optimal shot": aim the puck straight at the top goal center.
+  // A real system would swap this for a solver or trained policy suggestion.
   function computeDummyOptimalVector() {
-    const toPuck = Vector.sub(puck.position, playerStriker.position);
-    const dir = Vector.normalise(toPuck);
-    // Nudge the aim toward the top goal center for a more "shot-like" preview.
-    const toGoal = Vector.normalise(Vector.sub({ x: W / 2, y: 0 }, puck.position));
-    const blended = Vector.normalise(Vector.add(dir, Vector.mult(toGoal, 0.5)));
-    return Vector.mult(blended, CONFIG.FLICK_MAX_SPEED * 0.8);
+    const dir = Vector.normalise(Vector.sub({ x: W / 2, y: 0 }, puck.position));
+    return Vector.mult(dir, CONFIG.FLICK_MAX_SPEED * 0.85);
   }
 
   /* ========================================================================
-   * OVERLAY RENDERING (drag line + assist trajectory)
+   * OVERLAY RENDERING (drag band + trajectory previews)
    * ======================================================================*/
   Events.on(render, "afterRender", function () {
     const ctx = render.context;
 
-    // 1. Live slingshot aim guide while dragging.
-    if (state.dragging && state.dragStart && state.dragCurrent) {
-      const launch = computeFlickVelocity(state.dragStart, state.dragCurrent);
-      // Pullback line (pointer -> striker)
-      drawDottedPath(ctx, [state.dragCurrent, state.dragStart], "#ffffff", 0.5);
-      // Launch direction preview (striker -> forward)
-      const tip = Vector.add(state.dragStart, Vector.mult(launch, 6));
-      drawArrow(ctx, state.dragStart, tip, "#4ea1ff");
+    if (state.dragging && state.dragAnchor && state.dragCurrent) {
+      const launch = computeFlickVelocity(state.dragAnchor, state.dragCurrent);
+      const powered = (launch.x !== 0 || launch.y !== 0);
+
+      // Rubber band: pointer -> puck anchor (anchored EXACTLY at puck center).
+      drawLine(ctx, state.dragCurrent, state.dragAnchor, "rgba(255,255,255,0.35)", 2, [6, 6]);
+      drawRing(ctx, state.dragCurrent, 6, "rgba(255,255,255,0.5)");
+      drawRing(ctx, state.dragAnchor, CONFIG.PUCK_RADIUS + 3, powered ? "#30d158" : "rgba(255,255,255,0.4)");
+
+      // Predicted flight path from the puck for the player's own shot.
+      if (powered) {
+        const preview = drawAimAssistTrajectory(launch);
+        drawDottedPath(ctx, preview, "rgba(48,209,88,0.9)", 1);
+      }
     }
 
-    // 2. AI Aim Assist ghost trajectory (Normal mode only).
-    if (state.mode === MODE.NORMAL && state.aimAssist) {
-      const suggested = computeDummyOptimalVector();
-      state.assistPath = drawAimAssistTrajectory(suggested);
-      drawDottedPath(ctx, state.assistPath, "#7CFF9B", 1);
+    // Standing AI Aim Assist preview (Normal mode, not dragging).
+    if (state.mode === MODE.NORMAL && state.aimAssist && !state.dragging) {
+      state.assistPath = drawAimAssistTrajectory(computeDummyOptimalVector());
+      drawDottedPath(ctx, state.assistPath, "rgba(124,255,155,0.85)", 1);
     }
   });
 
@@ -406,35 +388,26 @@
     ctx.save();
     ctx.globalAlpha = alpha;
     ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.setLineDash([5, 6]);
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = "round";
+    ctx.setLineDash([2, 9]);
     ctx.beginPath();
     ctx.moveTo(points[0].x, points[0].y);
-    for (let i = 1; i < points.length; i++) {
-      ctx.lineTo(points[i].x, points[i].y);
-    }
+    for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
     ctx.stroke();
-    ctx.setLineDash([]);
     ctx.restore();
   }
-
-  function drawArrow(ctx, from, to, color) {
+  function drawLine(ctx, a, b, color, w, dash) {
     ctx.save();
-    ctx.strokeStyle = color;
-    ctx.fillStyle = color;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(from.x, from.y);
-    ctx.lineTo(to.x, to.y);
-    ctx.stroke();
-    const ang = Math.atan2(to.y - from.y, to.x - from.x);
-    const head = 8;
-    ctx.beginPath();
-    ctx.moveTo(to.x, to.y);
-    ctx.lineTo(to.x - head * Math.cos(ang - 0.4), to.y - head * Math.sin(ang - 0.4));
-    ctx.lineTo(to.x - head * Math.cos(ang + 0.4), to.y - head * Math.sin(ang + 0.4));
-    ctx.closePath();
-    ctx.fill();
+    ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = "round";
+    if (dash) ctx.setLineDash(dash);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    ctx.restore();
+  }
+  function drawRing(ctx, c, r, color) {
+    ctx.save();
+    ctx.strokeStyle = color; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(c.x, c.y, r, 0, Math.PI * 2); ctx.stroke();
     ctx.restore();
   }
 
@@ -443,41 +416,34 @@
    * ======================================================================*/
   function setMode(mode) {
     state.mode = mode;
-
-    const normalBtn = document.getElementById("mode-normal");
-    const trainBtn  = document.getElementById("mode-training");
-    const assistToggle = document.getElementById("assist-toggle");
-    const assistRow = document.getElementById("assist-row");
-
     const isNormal = mode === MODE.NORMAL;
 
-    normalBtn.classList.toggle("active", isNormal);
-    trainBtn.classList.toggle("active", !isNormal);
-    normalBtn.setAttribute("aria-selected", String(isNormal));
-    trainBtn.setAttribute("aria-selected", String(!isNormal));
+    const seg = document.getElementById("mode-seg");
+    seg.setAttribute("data-active", mode);
+    document.getElementById("mode-normal").classList.toggle("active", isNormal);
+    document.getElementById("mode-training").classList.toggle("active", !isNormal);
+    document.getElementById("mode-normal").setAttribute("aria-selected", String(isNormal));
+    document.getElementById("mode-training").setAttribute("aria-selected", String(!isNormal));
 
-    // Aim assist only applies to human play.
+    const assistToggle = document.getElementById("assist-toggle");
+    const assistRow = document.getElementById("assist-row");
     assistToggle.disabled = !isNormal;
-    assistRow.style.opacity = isNormal ? "1" : "0.4";
+    assistRow.classList.toggle("disabled", !isNormal);
 
-    // Cancel any in-flight drag when switching modes.
+    // Cancel any in-flight drag on mode switch.
     state.dragging = false;
-    state.dragStart = null;
+    state.dragAnchor = null;
     state.dragCurrent = null;
-
     arenaEl.classList.toggle("input-disabled", !isNormal);
 
     if (isNormal) {
-      // Resume the auto-runner: physics advances on its own each frame.
-      Runner.run(runner, engine);
+      Runner.run(runner, engine);          // physics free-runs
       modeHintEl.textContent = state.aimAssist
-        ? "Aim assist on: green line previews the suggested shot."
-        : "Drag from your striker and release to flick.";
+        ? "Aim assist on — the green line previews the suggested shot."
+        : "Drag from the puck and release to flick it.";
     } else {
-      // TRAINING: stop the auto-runner. The world now advances ONLY via
-      // GameEnv.step(action). Render keeps painting the frozen/last state.
-      Runner.stop(runner);
-      modeHintEl.textContent = "Training mode: control the game via GameEnv.step(action).";
+      Runner.stop(runner);                 // world advances only via GameEnv.step()
+      modeHintEl.textContent = "Training mode — drive the puck via GameEnv.step(action).";
     }
   }
 
@@ -485,119 +451,65 @@
    * RESET
    * ======================================================================*/
   function resetGame(resetScore) {
-    Body.setPosition(puck, { x: W / 2, y: H / 2 - 60 });
-    Body.setVelocity(puck, { x: 0, y: 0 });
-    Body.setAngularVelocity(puck, 0);
-
-    Body.setPosition(playerStriker, { x: W / 2, y: H * 0.82 });
-    Body.setVelocity(playerStriker, { x: 0, y: 0 });
-    Body.setAngularVelocity(playerStriker, 0);
-
-    Body.setPosition(aiStriker, { x: W / 2, y: H * 0.18 });
-    Body.setVelocity(aiStriker, { x: 0, y: 0 });
-    Body.setAngularVelocity(aiStriker, 0);
-
-    if (resetScore) {
-      state.score.left = 0;
-      state.score.right = 0;
-      updateScoreboard();
-    }
+    recenterPuck();
+    if (resetScore) { state.score.left = 0; state.score.right = 0; updateScoreboard(); }
   }
 
   /* ========================================================================
-   * HEADLESS API — GameEnv
-   *
-   * The bridge for an external reinforcement-learning script (e.g. Python via
-   * a browser automation / websocket layer). Designed to be used in TRAINING
-   * mode, where the auto-runner is stopped and the agent drives stepping.
-   *
-   * Coordinates are in world/canvas pixels. Origin (0,0) is the top-left of
-   * the playfield; +x is right, +y is down.
+   * HEADLESS API — GameEnv  (RL bridge; use in TRAINING mode)
+   * World/canvas pixels; origin top-left, +x right, +y down.
    * ======================================================================*/
   const GameEnv = {
-    /** Static description of the environment (bounds, action shape, etc.). */
     spec() {
       return {
-        width: W,
-        height: H,
-        actionSpace: {
-          // action = { vx, vy }: velocity applied to the player striker.
-          type: "box",
-          shape: [2],
+        width: W, height: H,
+        actionSpace: { type: "box", shape: [2],
           low: [-CONFIG.FLICK_MAX_SPEED, -CONFIG.FLICK_MAX_SPEED],
-          high: [CONFIG.FLICK_MAX_SPEED, CONFIG.FLICK_MAX_SPEED]
-        },
+          high: [CONFIG.FLICK_MAX_SPEED, CONFIG.FLICK_MAX_SPEED] },
         goals: { top: "left-scores", bottom: "right-scores" }
       };
     },
-
-    /** Snapshot of the full observable state. */
     getState() {
-      const snap = (b) => ({
-        x: b.position.x, y: b.position.y,
-        vx: b.velocity.x, vy: b.velocity.y,
-        angle: b.angle
-      });
-      return {
-        mode: state.mode,
-        score: { left: state.score.left, right: state.score.right },
-        puck: snap(puck),
-        player: snap(playerStriker),
-        ai: snap(aiStriker)
-      };
+      const snap = (b) => ({ x: b.position.x, y: b.position.y, vx: b.velocity.x, vy: b.velocity.y, angle: b.angle });
+      return { mode: state.mode, score: { ...state.score }, puck: snap(puck) };
     },
-
     /**
-     * Apply an action and advance the simulation by one tick.
-     * @param {{vx:number, vy:number}|[number,number]} action
-     * @param {object} [opts]
-     * @param {number} [opts.substeps=1] number of engine ticks to advance.
-     * @returns {{state:object, reward:number, done:boolean}}
+     * Apply an action (impulse velocity on the puck) and advance the sim.
+     * @param {{vx:number,vy:number}|[number,number]} action
+     * @param {{substeps?:number}} [opts]
      */
     step(action, opts) {
       const substeps = (opts && opts.substeps) || 1;
       const before = { l: state.score.left, r: state.score.right };
-
       if (action) {
         const vx = Array.isArray(action) ? action[0] : action.vx;
         const vy = Array.isArray(action) ? action[1] : action.vy;
-        // Clamp to the action space.
-        const cx = clamp(vx || 0, -CONFIG.FLICK_MAX_SPEED, CONFIG.FLICK_MAX_SPEED);
-        const cy = clamp(vy || 0, -CONFIG.FLICK_MAX_SPEED, CONFIG.FLICK_MAX_SPEED);
-        Body.setVelocity(playerStriker, { x: cx, y: cy });
+        Body.setVelocity(puck, {
+          x: clamp(vx || 0, -CONFIG.FLICK_MAX_SPEED, CONFIG.FLICK_MAX_SPEED),
+          y: clamp(vy || 0, -CONFIG.FLICK_MAX_SPEED, CONFIG.FLICK_MAX_SPEED)
+        });
       }
-
-      // Manually advance the (auto-runner-stopped) engine.
-      for (let i = 0; i < substeps; i++) {
-        Engine.update(engine, CONFIG.TRAIN_DT);
-      }
-
-      // Reward: +1 for scoring in the top goal (agent's target), -1 if scored on.
+      for (let i = 0; i < substeps; i++) Engine.update(engine, CONFIG.TRAIN_DT);
       let reward = 0;
-      if (state.score.left > before.l) reward += 1;
-      if (state.score.right > before.r) reward -= 1;
-
+      if (state.score.left  > before.l) reward += 1;   // scored in target goal
+      if (state.score.right > before.r) reward -= 1;   // own goal
       return { state: this.getState(), reward, done: false };
     },
-
-    /** Reset positions (and optionally the score) to the start configuration. */
-    reset(opts) {
-      const keepScore = opts && opts.keepScore;
-      resetGame(!keepScore);
-      return this.getState();
-    },
-
-    /** Programmatic mode switch (mirrors the overlay toggle). */
-    setMode(mode) {
-      if (mode === MODE.NORMAL || mode === MODE.TRAINING) setMode(mode);
-      return state.mode;
-    }
+    reset(opts) { resetGame(!(opts && opts.keepScore)); return this.getState(); },
+    setMode(mode) { if (mode === MODE.NORMAL || mode === MODE.TRAINING) setMode(mode); return state.mode; }
   };
-
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
-
-  // Expose globally so an external script can reach the bridge.
   window.GameEnv = GameEnv;
+
+  // Internal hook for tests / external tooling (pure math + live refs).
+  window.KnockHockey = {
+    CONFIG,
+    computeFlickVelocity,
+    toWorld,
+    getDrag: () => ({ dragging: state.dragging, anchor: state.dragAnchor, current: state.dragCurrent }),
+    getPuck: () => ({ x: puck.position.x, y: puck.position.y, vx: puck.velocity.x, vy: puck.velocity.y }),
+    bounds: { W, H }
+  };
 
   /* ========================================================================
    * UI WIRING
@@ -611,12 +523,12 @@
       state.assistPath = null;
       if (state.mode === MODE.NORMAL) {
         modeHintEl.textContent = state.aimAssist
-          ? "Aim assist on: green line previews the suggested shot."
-          : "Drag from your striker and release to flick.";
+          ? "Aim assist on — the green line previews the suggested shot."
+          : "Drag from the puck and release to flick it.";
       }
     });
 
-    document.getElementById("reset-btn").addEventListener("click", () => resetGame(true));
+    document.getElementById("reset-btn").addEventListener("click", () => resetGame(false));
 
     const overlay = document.getElementById("overlay");
     document.getElementById("overlay-handle").addEventListener("click", (e) => {
@@ -631,5 +543,5 @@
   buildArena();
   updateScoreboard();
   wireUI();
-  setMode(MODE.NORMAL);   // starts the runner
+  setMode(MODE.NORMAL);
 })();
