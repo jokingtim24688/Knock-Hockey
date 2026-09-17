@@ -1,0 +1,244 @@
+/* ============================================================
+   Knock Hockey — sketch / wireframe styling.
+   Intentionally minimal: solid colors, basic shapes, thin lines.
+   The whole point is to keep visuals cheap so physics is the focus.
+   ============================================================ */
+
+:root {
+  --phone-w: 390px;
+  --phone-h: 844px;
+  --hud-h: 72px;
+
+  --ink: #e8e8e8;         /* light "pen" color on dark field */
+  --line: #6f7480;        /* wireframe stroke */
+  --field: #14161c;       /* playfield background */
+  --page-bg: #0a0b0e;     /* dark webpage */
+  --accent: #4ea1ff;      /* player 1 */
+  --accent-2: #ff7a59;    /* player 2 */
+  --magenta: #ff00ff;     /* CV anchor color — must stay exact */
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--page-bg);
+  color: var(--ink);
+  font-family: "Courier New", ui-monospace, monospace; /* utilitarian, sketch-like */
+  /* Center the phone on the dark page */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+}
+
+/* -------- The "phone" container: EXACTLY 390 x 844 -------- */
+.phone {
+  position: relative;
+  width: var(--phone-w);
+  height: var(--phone-h);
+  background: var(--field);
+  border: 1px solid var(--line);
+  border-radius: 0;           /* keep it a plain rectangle for clean CV bounds */
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* -------- Computer-vision anchors (10x10 magenta squares) -------- */
+.cv-anchor {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  background: var(--magenta);
+  z-index: 9999;             /* always on top so nothing occludes them */
+  pointer-events: none;
+}
+.cv-tl { top: 0; left: 0; }
+.cv-tr { top: 0; right: 0; }
+.cv-bl { bottom: 0; left: 0; }
+.cv-br { bottom: 0; right: 0; }
+
+/* -------- Fake multiplayer HUD -------- */
+.hud {
+  height: var(--hud-h);
+  flex: 0 0 var(--hud-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--line);
+  background: #10121a;
+}
+
+.player {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: 64px;
+}
+
+.avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 2px solid var(--line);
+  background: #22252f;
+}
+.player-left .avatar { border-color: var(--accent); }
+.player-right .avatar { border-color: var(--accent-2); }
+
+.player-name {
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: var(--line);
+}
+
+.scoreboard {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 28px;
+  font-weight: bold;
+}
+.score-sep { color: var(--line); }
+#score-left { color: var(--accent); }
+#score-right { color: var(--accent-2); }
+
+/* -------- Playfield -------- */
+.arena {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+#game-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--field);
+}
+
+/* -------- Overlay menu -------- */
+.overlay {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  z-index: 500;
+  width: 210px;
+  background: rgba(16, 18, 26, 0.92);
+  border: 1px solid var(--line);
+  font-size: 12px;
+}
+
+.overlay-handle {
+  display: block;
+  width: 100%;
+  padding: 6px 10px;
+  background: #1b1e28;
+  color: var(--ink);
+  border: none;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  letter-spacing: 2px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.overlay-body {
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.overlay.collapsed .overlay-body { display: none; }
+
+.control-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.control-label {
+  color: var(--line);
+  letter-spacing: 1px;
+}
+
+/* Segmented control */
+.segmented {
+  display: flex;
+  border: 1px solid var(--line);
+}
+.seg-btn {
+  background: transparent;
+  color: var(--ink);
+  border: none;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+}
+.seg-btn + .seg-btn { border-left: 1px solid var(--line); }
+.seg-btn.active { background: var(--accent); color: #0a0b0e; font-weight: bold; }
+
+/* Sub-toggle switch */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 40px;
+  height: 20px;
+}
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider {
+  position: absolute;
+  inset: 0;
+  background: #22252f;
+  border: 1px solid var(--line);
+  transition: background 0.15s;
+}
+.slider::before {
+  content: "";
+  position: absolute;
+  height: 14px;
+  width: 14px;
+  left: 2px;
+  top: 2px;
+  background: var(--ink);
+  transition: transform 0.15s;
+}
+.switch input:checked + .slider { background: var(--accent); }
+.switch input:checked + .slider::before { transform: translateX(20px); }
+.switch input:disabled + .slider { opacity: 0.4; }
+
+.ghost-btn {
+  width: 100%;
+  padding: 6px 10px;
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--line);
+  cursor: pointer;
+  font-family: inherit;
+  letter-spacing: 1px;
+}
+.ghost-btn:hover { background: #1b1e28; }
+
+.mode-hint {
+  margin: 0;
+  color: var(--line);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/* Disabled interaction state (Training Mode) reflected on the arena cursor */
+.arena.input-disabled { cursor: not-allowed; }

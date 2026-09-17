@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <!-- Locked viewport: the game is structurally sized like a phone screen even on desktop -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Knock Hockey</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!--
+    THE "PHONE" CONTAINER
+    Exactly 390 x 844 px (iPhone-ish logical resolution). Everything the game
+    renders lives inside this box so an external OpenCV script can treat it as
+    the entire device screen.
+  -->
+  <div id="phone" class="phone">
+
+    <!--
+      COMPUTER VISION ANCHORS
+      10x10 pure magenta (#FF00FF) squares pinned to the four absolute corners.
+      A Python/OpenCV script thresholds for this exact color to recover the
+      bounding box (and therefore the pixel-to-game coordinate mapping).
+    -->
+    <div class="cv-anchor cv-tl"></div>
+    <div class="cv-anchor cv-tr"></div>
+    <div class="cv-anchor cv-bl"></div>
+    <div class="cv-anchor cv-br"></div>
+
+    <!-- FAKE MULTIPLAYER HEADER: two profile circles + scoreboard -->
+    <header class="hud">
+      <div class="player player-left">
+        <div class="avatar" aria-hidden="true"></div>
+        <span class="player-name">P1</span>
+      </div>
+
+      <div class="scoreboard">
+        <span id="score-left" class="score">0</span>
+        <span class="score-sep">-</span>
+        <span id="score-right" class="score">0</span>
+      </div>
+
+      <div class="player player-right">
+        <div class="avatar" aria-hidden="true"></div>
+        <span class="player-name">P2</span>
+      </div>
+    </header>
+
+    <!-- PLAYFIELD: Matter.js renders into this canvas -->
+    <div id="arena" class="arena">
+      <canvas id="game-canvas"></canvas>
+    </div>
+
+    <!--
+      OVERLAY MENU
+      An HTML overlay layered on top of the canvas. Holds the primary Mode
+      Toggle (segmented control) and, in Normal Mode, the AI Aim Assist
+      sub-toggle. Collapsible so it does not permanently cover the field.
+    -->
+    <div id="overlay" class="overlay">
+      <button id="overlay-handle" class="overlay-handle" type="button" aria-expanded="true">
+        MENU
+      </button>
+
+      <div id="overlay-body" class="overlay-body">
+        <div class="control-row">
+          <label class="control-label">Mode</label>
+          <!-- Segmented Mode Toggle: Normal (human) vs Training (headless API) -->
+          <div class="segmented" role="tablist" aria-label="Engine mode">
+            <button id="mode-normal" class="seg-btn active" role="tab" aria-selected="true" type="button">
+              Normal
+            </button>
+            <button id="mode-training" class="seg-btn" role="tab" aria-selected="false" type="button">
+              Training
+            </button>
+          </div>
+        </div>
+
+        <!-- Sub-toggle: only meaningful in Normal Mode -->
+        <div class="control-row" id="assist-row">
+          <label class="control-label" for="assist-toggle">AI Aim Assist</label>
+          <label class="switch">
+            <input type="checkbox" id="assist-toggle" />
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="control-row">
+          <button id="reset-btn" class="ghost-btn" type="button">Reset</button>
+        </div>
+
+        <p id="mode-hint" class="mode-hint">
+          Drag from your striker and release to flick.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Matter.js physics engine (vendored locally so the prototype runs offline) -->
+  <script src="matter.min.js"></script>
+  <!-- Game logic -->
+  <script src="game.js"></script>
+</body>
+</html>
